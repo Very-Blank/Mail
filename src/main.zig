@@ -42,11 +42,58 @@ const SmtpCommand = enum {
 // FULL:
 // <char> ::= <c> | "\" <x>
 // IMPL:
-// <char> ::= <a>
+// <char> ::= <a> | <d>
 
 const Path = struct {
     local: []const u8,
     domain: []const u8,
+
+    pub fn parse(buffer: []const u8) !Path {
+        if (buffer.len < 2)
+            return error.BufferLenTooShort;
+
+        const start: usize = found: {
+            for (0..buffer.len) |i| {
+                switch (buffer[i]) {
+                    '<' => break :found i,
+                }
+            }
+
+            return error.NoPathStart;
+        };
+
+        // It's much more easier to guarantee corrrect behaviour if
+        // we start from the end.
+        // Since it's possible for the local part to have: "\" <x>
+        // Where <x> could be ">"
+        const end: usize = found: {
+            var i: usize = buffer.len - 1;
+            while (0 < i) : (i -= 1) {
+                switch (buffer[i]) {
+                    '>' => break :found i,
+                }
+            }
+
+            return error.NoPathEnd;
+        };
+
+        // Same here.
+        const middle: usize = found: {
+            var i: usize = end;
+            while (0 < i) : (i -= 1) {
+                switch (buffer[i]) {
+                    '@' => break :found i,
+                }
+            }
+
+            return error.NoPathMiddle;
+        };
+
+        return .{
+            .local = buffer[middle + 1 .. end],
+            .domain = buffer[start + 1 .. middle],
+        };
+    }
 };
 
 const SmtpServer = struct {
