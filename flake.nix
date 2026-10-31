@@ -26,7 +26,7 @@
 
         extraModule = {...}: {
           config.nmux = {
-            name = "Mail";
+            name = "Mail-Protocols";
             shell = "${pkgs.lib.getExe pkgs.zsh}";
             extraConfig = ''
               set-hook -g session-created 'send-keys "nvim" enter ; new-window ; select-window -t 0'
@@ -41,7 +41,8 @@
           pkgs.zig_0_17
 
           (pkgs.writeShellApplication {
-            name = "test";
+            name = "do-test";
+            runtimeInputs = [pkgs.netcat pkgs.coreutils];
             text = ''
               commands=(
               'HELO localhost\r\n'
@@ -51,7 +52,7 @@
               'Subject: Test message\r\nFrom: sender@example.com\r\nTo: recipient@example.com\r\n\r\nHello, this is a test.\r\n.\r\n'
               'QUIT\r\n'
               )
-                          
+                  
               (for command in "''${commands[@]}" ; do
                   sleep 1
                   printf '%b' "$command"

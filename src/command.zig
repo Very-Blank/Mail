@@ -1,11 +1,8 @@
 const std = @import("std");
 const linux = std.os.linux;
 
-// https://www.rfc-editor.org/info/rfc821/#page-42
-// NOTE: We limit the sizes here since it makes things very convenient for us.
-const user_max_len = 64;
-const domain_max_len = 64;
-const command_max_len = 512;
+const Domain = @import("domain.zig");
+const Path = @import("path.zig");
 
 pub const CommandType = enum {
     // https://www.rfc-editor.org/info/rfc821/#section-4.1
@@ -19,18 +16,12 @@ pub const CommandType = enum {
 
     pub fn parse(buffer: [4]u8) !Self {
         inline for (@typeInfo(Self).@"enum".field_names) |name| {
-            no_match: {
-                inline for (0..4) |i|
-
-                    // https://www.rfc-editor.org/info/rfc821/#section-4.1.2
-                    if (buffer[i] != name[i] and (buffer[i] -% 32) != name[i])
-                        break :no_match;
-
+            // https://www.rfc-editor.org/info/rfc821/#section-4.1.2
+            if (std.ascii.eqlIgnoreCase(name, &buffer))
                 return @field(Self, name);
-            }
         }
 
-        return error.NotACommand;
+        return error.InvalidCommand;
     }
 };
 
@@ -42,53 +33,62 @@ pub const Command = union(CommandType) {
     QUIT: void,
 
     // https://www.rfc-editor.org/info/rfc821/#page-42
-    pub const User = struct {
-        buffer: [user_max_len]u8 = @splat(0),
-        len: u8 = 0,
+    const max_len = 512;
 
-        pub inline fn get(self: *const User) []const u8 {
-            std.debug.assert(0 < self.len and self.len <= user_max_len);
-            return self.buffer[0..self.len];
-        }
+    pub const Reader = struct {
+        buffer: []const u8,
+        index: usize = 0,
 
-        pub fn valid(self: User) bool {
-            std.debug.assert(self.len <= user_max_len);
-
-            if (self.len == 0)
-                return false;
-
-            for (self.get(), 0..) |c, i| {
-                if (std.ascii.isAlphanumeric(c))
-                    continue;
-
-                if (c == '.' and
-                    i + 1 < self.len and
-                    std.ascii.isAlphanumeric(self.buffer[i + 1]))
-                    continue;
-
+        pub inline fn consume(self: *Reader, n: usize) bool {
+            if (self.buffer.len <= self.index + n) {
+                self.index = self.buffer.len;
                 return false;
             }
 
+            defer self.index += n;
+
             return true;
         }
-    };
 
-    pub const Domain = struct {
-        buffer: [domain_max_len]u8 = @splat(0),
-        len: u8 = 0,
+        pub inline fn consumeSpace(self: *Reader) void {
+            while (self.index < self.buffer.len and self.buffer[self.index] == ' ') : (self.index += 1) {}
+        }
 
-        pub inline fn get(self: *const Domain) []const u8 {
-            std.debug.assert(0 < self.len and self.len <= domain_max_len);
-            return self.buffer[0..self.len];
+        pub inline fn consumeExpect(self: *Reader, expected: []const u8) bool {
+            if (self.buffer.len <= self.index + expected.len)
+                return false;
+
+            defer self.index += expected.len;
+
+            return std.ascii.eqlIgnoreCase(
+                self.buffer[self.index .. self.index + expected.len],
+                expected,
+            );
+        }
+
+        pub inline fn readToEnd(self: *Reader) ![]const u8 {
+            if (self.buffer.len <= self.index)
+                return error.InvalidCommand;
+
+            const start = self.index;
+
+            while (self.index < self.buffer.len) : (self.index += 1) {
+                if (self.buffer[self.index] == '\r' and self.index + 1 < self.buffer.len and self.buffer[self.index + 1] == '\n' and self.index != start) {
+                    return self.buffer[start..self.index];
+                }
+            }
+
+            return error.InvalidCommand;
         }
     };
 
-    pub const Path = struct {
-        user: User,
-        domain: Domain,
-    };
+    pub fn parse(buffer: [max_len]u8) !Command {
+        var reader: Reader = .{ .buffer = &buffer };
 
-    pub fn parse(buffer: [command_max_len]u8) !Command {
+        std.debug.assert(
+            reader.consume(4),
+        );
+
         const command: CommandType = try .parse(.{
             buffer[0],
             buffer[1],
@@ -99,137 +99,76 @@ pub const Command = union(CommandType) {
         switch (command) {
             // HELO <SP> <domain> <CRLF>
             .HELO => {
-                if (buffer[4] != ' ')
+                if (!reader.consumeExpect(" "))
                     return error.NoSeperator;
 
-                var i: usize = 4;
-                while (buffer[i] == ' ' and i < buffer.len) : (i += 1) {}
+                reader.consumeSpace();
 
-                // FIXME: 10 is just a magic number, find the mininum valid number.
-                if (buffer.len <= i + 10)
-                    return error.Invalid;
-
-                // FIXME: for test:
-                return .{ .DATA = {} };
+                return .{
+                    .HELO = try Domain.parse(try reader.readToEnd()),
+                };
             },
             // MAIL <SP> FROM:<reverse-path> <CRLF>
             .MAIL => {
-                if (buffer[4] != ' ')
+                if (!reader.consumeExpect(" "))
                     return error.NoSeperator;
 
-                var i: usize = 4;
-                while (buffer[i] == ' ' and i < buffer.len) : (i += 1) {}
+                reader.consumeSpace();
 
-                // FIXME: 10 is just a magic number, find the mininum valid number.
-                if (buffer.len <= i + 10)
-                    return error.Invalid;
+                if (!reader.consumeExpect("FROM:"))
+                    return error.InvalidCommand;
 
-                if (!std.mem.eql(u8, buffer[i .. i + ("FROM:").len], "FROM:"))
-                    return error.Invalid;
+                const slice = try reader.readToEnd();
 
-                return .{ .MAIL = try parsePath(buffer) };
+                return .{ .MAIL = try Path.parse(slice) };
             },
             // RCPT <SP> TO:<forward-path> <CRLF>
             .RCPT => {
-                if (buffer[4] != ' ')
+                if (!reader.consumeExpect(" "))
                     return error.NoSeperator;
 
-                var i: usize = 4;
-                while (buffer[i] == ' ' and i < buffer.len) : (i += 1) {}
+                reader.consumeSpace();
 
-                // FIXME: 10 is just a magic number, find the mininum valid number.
-                if (buffer.len <= i + 10)
-                    return error.Invalid;
+                if (!reader.consumeExpect("TO:"))
+                    return error.InvalidCommand;
 
-                if (!std.mem.eql(u8, buffer[i .. i + ("TO:").len], "TO:"))
-                    return error.Invalid;
+                const slice = try reader.readToEnd();
 
-                return .{ .MAIL = try parsePath(buffer) };
+                return .{ .RCPT = try Path.parse(slice) };
             },
-            // DATA <CRLF>
             .DATA => {
+                if (!reader.consumeExpect("\r\n"))
+                    return error.InvalidCommand;
+
                 return .{ .DATA = {} };
             },
             // QUIT <CRLF>
             .QUIT => {
+                if (!reader.consumeExpect("\r\n"))
+                    return error.InvalidCommand;
                 return .{ .QUIT = {} };
             },
         }
     }
-
-    // https://www.rfc-editor.org/info/rfc821/#page-30
-    // We only implement a subset of the spec.
-    // FULL:
-    // <path> ::= "<" [ <a-d-l> ":" ] <mailbox> ">"
-    // IMPL:
-    // <path> ::= "<" <mailbox> ">"
-    //
-    // FULL:
-    // <local-part> ::= <dot-string> | <quoted-string>
-    // IMPL:
-    // <local-part> ::= <dot-string>
-    //
-    // FULL:
-    // <char> ::= <c> | "\" <x>
-    // IMPL:
-    // <char> ::= <a> | <d>
-    pub fn parsePath(buffer: [command_max_len]u8) !Path {
-        const start: usize = found: {
-            for (0..buffer.len) |i| {
-                switch (buffer[i]) {
-                    '<' => break :found i,
-                    else => {},
-                }
-            }
-
-            return error.NoPathStart;
-        };
-
-        // It's much more easier to guarantee corrrect behaviour if
-        // we start from the end.
-        // Since it's possible for the local part to have: "\" <x>
-        // Where <x> could be ">" and other bs
-        const end: usize = found: {
-            var i: usize = buffer.len - 1;
-            while (0 < i) : (i -= 1) {
-                switch (buffer[i]) {
-                    '>' => break :found i,
-                    else => {},
-                }
-            }
-
-            return error.NoPathEnd;
-        };
-
-        // Same here.
-        const middle: usize = found: {
-            var i: usize = end;
-            while (0 < i) : (i -= 1) {
-                switch (buffer[i]) {
-                    '@' => break :found i,
-                    else => {},
-                }
-            }
-
-            return error.NoPathMiddle;
-        };
-
-        if (!(start + 1 < middle and middle + 1 < end))
-            return error.InvalidPath;
-
-        var path: Path = .{
-            .domain = .{},
-            .user = .{},
-        };
-
-        const user: []const u8 = buffer[start + 1 .. middle];
-        @memcpy(path.user.buffer[0..user.len], user);
-        path.user.len = @intCast(user.len);
-
-        const domain: []const u8 = buffer[middle + 1 .. end];
-        @memcpy(path.domain.buffer[0..domain.len], domain);
-        path.domain.len = @intCast(domain.len);
-
-        return path;
-    }
 };
+
+test "Valid commands" {
+    try std.testing.expectEqual(CommandType.HELO, try CommandType.parse("HELO".*));
+    try std.testing.expectEqual(CommandType.MAIL, try CommandType.parse("MAIL".*));
+    try std.testing.expectEqual(CommandType.RCPT, try CommandType.parse("RCPT".*));
+    try std.testing.expectEqual(CommandType.DATA, try CommandType.parse("DATA".*));
+    try std.testing.expectEqual(CommandType.QUIT, try CommandType.parse("QUIT".*));
+}
+
+test "Invalid commands" {
+    try std.testing.expectError(error.InvalidCommand, CommandType.parse("SOME".*));
+    try std.testing.expectError(error.InvalidCommand, CommandType.parse("BURG".*));
+    try std.testing.expectError(error.InvalidCommand, CommandType.parse("HDFD".*));
+}
+
+test "Case insensitive of commands" {
+    try std.testing.expectEqual(CommandType.HELO, try CommandType.parse("heLo".*));
+    try std.testing.expectEqual(CommandType.HELO, try CommandType.parse("hELo".*));
+    try std.testing.expectEqual(CommandType.HELO, try CommandType.parse("Helo".*));
+    try std.testing.expectEqual(CommandType.HELO, try CommandType.parse("hElO".*));
+}

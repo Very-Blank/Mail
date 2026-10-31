@@ -1,13 +1,13 @@
 const std = @import("std");
 const linux = std.os.linux;
 
+const Client = @import("client.zig");
+
 port: u16 = std.mem.nativeToBig(u16, 6000),
 address: u32 = @bitCast([4]u8{ 127, 0, 0, 1 }),
 socket: linux.fd_t,
 
 const Self = @This();
-
-const Command = @import("command.zig").Command;
 
 pub fn init(
     address: struct {
@@ -59,45 +59,33 @@ pub fn deinit(self: *const Self) void {
 }
 
 pub fn run(self: *Self) !void {
-    const accepted_socket: linux.fd_t = init: {
-        const result = linux.accept(
-            self.socket,
-            @ptrCast(&self.address),
-            @constCast(&@as(linux.socklen_t, @sizeOf(linux.sockaddr.in))),
-        );
-
-        if (linux.errno(result) != .SUCCESS)
-            return error.FailedToAccept;
-
-        break :init @intCast(result);
-    };
-
-    defer {
-        _ = linux.shutdown(accepted_socket, linux.SHUT.RDWR);
-        _ = linux.close(accepted_socket);
-    }
-
-    std.debug.print("Client connected\n", .{});
-
-    std.debug.print("Reading input\n", .{});
-
     while (true) {
-        var buffer: [512]u8 = @splat(0);
+        std.debug.print("Waiting for client to connect\n", .{});
 
-        const result = linux.read(
-            accepted_socket,
-            &buffer,
-            buffer.len,
-        );
+        var client: Client = init: {
+            var details: linux.sockaddr.in = undefined;
+            var len: linux.socklen_t = @sizeOf(linux.sockaddr.in);
 
-        if (linux.errno(result) != .SUCCESS) {
-            return error.FailedToRead;
-        }
+            const result = linux.accept(
+                self.socket,
+                @ptrCast(&details),
+                &len,
+            );
 
-        const command = Command.parse(buffer) catch continue;
+            if (linux.errno(result) != .SUCCESS)
+                return error.FailedToAccept;
 
-        std.debug.print("Command: {any}\n", .{command});
+            break :init .{
+                .socket = @intCast(result),
+                .details = details,
+            };
+        };
+
+        std.debug.print("Client connected\n", .{});
+
+        try client.serve();
+        defer client.deinit();
+
+        std.debug.print("Client disconnected\n", .{});
     }
-
-    std.debug.print("Client disconnected\n", .{});
 }
