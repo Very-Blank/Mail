@@ -40,6 +40,25 @@
         packages = [
           pkgs.zig_0_17
 
+          (pkgs.writeShellApplication {
+            name = "test";
+            text = ''
+              commands=(
+              'HELO localhost\r\n'
+              'MAIL FROM:<sender@example.com>\r\n'
+              'RCPT TO:<recipient@example.com>\r\n'
+              'DATA\r\n'
+              'Subject: Test message\r\nFrom: sender@example.com\r\nTo: recipient@example.com\r\n\r\nHello, this is a test.\r\n.\r\n'
+              'QUIT\r\n'
+              )
+                  
+              (for command in "$${commands[@]}"; do
+                sleep 1
+                printf '%b' "$command"
+              done) | nc 127.0.0.1 6000
+            '';
+          })
+
           (
             inputs.nixnvim.mkPackage {
               system = system;
