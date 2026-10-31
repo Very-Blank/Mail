@@ -51,10 +51,10 @@
               'Subject: Test message\r\nFrom: sender@example.com\r\nTo: recipient@example.com\r\n\r\nHello, this is a test.\r\n.\r\n'
               'QUIT\r\n'
               )
-                  
-              (for command in "$${commands[@]}"; do
-                sleep 1
-                printf '%b' "$command"
+                          
+              (for command in "''${commands[@]}" ; do
+                  sleep 1
+                  printf '%b' "$command"
               done) | nc 127.0.0.1 6000
             '';
           })
