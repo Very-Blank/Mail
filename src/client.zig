@@ -9,11 +9,27 @@ const CommandType = command.CommandType;
 const max_command_len = 512;
 const max_reply_len = 512;
 
+// Specification says min max is 1000, but it doesn't count for the transparency periods.
+// Example:
+//..<CRLF>
+//..<CRLF>
+//..<CRLF>
+//.<CRLF>
+// Would have 12 characters, but by spec actually 15.
+// We can use this function to see proportion of counted characters to all characters (worst case: all dots).
+// f(x) = (x × (3) + (3)) / (x × (4) + (3))
+// (lim x->inf = 3/4)
+// At 1000 only ~ 0.75% counted.
+// So to account for the whole we could do (1000 / 0.75) ~= 1333.33..
+// But for safety will do (1000 / (2/3)) = 1500
+const max_text_len = 1500;
+
 // FIXME: Change localhost to the actuall domain
 const domain = "localhost";
 
 commad_line: [max_command_len]u8 = @splat(0),
 reply_line: [max_reply_len]u8 = @splat(0),
+text_line: [max_text_len]u8 = @splat(0),
 socket: linux.fd_t,
 details: linux.sockaddr.in,
 
@@ -27,57 +43,71 @@ pub fn deinit(self: *Self) void {
 // Reply codes can be found here:
 // https://www.rfc-editor.org/info/rfc821/#page-35
 pub fn serve(self: *Self) !void {
-    try self.reply("{d} {s} Service ready\r\n", .{ 220, domain });
+    try self.reply("{d} {s} Service ready", .{ 220, domain });
 
-    var last_command: ?CommandType = null;
-    state: switch (try self.read()) {
-        .HELO => |client_domain| {
-            std.debug.print("client: HELO <SP> <{s}>\n", .{client_domain.get()});
+    origin: switch (try self.readCommand()) {
+        .HELO => |client_domain| switch (try self.readCommand()) {
+            .MAIL => |reverse_path| {
+                _ = client_domain;
+                _ = reverse_path;
 
-            if (last_command != null) {
+                mail: switch (try self.readCommand()) {
+                    .RCPT => |forward_path| {
+                        _ = forward_path;
+
+                        continue :mail try self.readCommand();
+                    },
+                    .DATA => {
+                        var buffer: []u8 = self.text_line[0..];
+                        var length: usize = 0;
+
+                        // FIXME: ADD MAX ITERATION COUNT
+                        while (true) {
+                            if (1400 <= length) {
+                                // FIXME: TOO MUCH DATA.
+                            }
+
+                            const result = linux.read(
+                                self.socket,
+                                buffer.ptr,
+                                buffer.len,
+                            );
+
+                            if (linux.errno(result) != .SUCCESS) {
+                                return error.FailedToRead;
+                            }
+
+                            // We do this because there is no way of knowing when the end sequence happens.
+                            if (std.mem.find(u8, &self.text_line, "\r\n.\r\n")) |end| {
+                                std.debug.print("DATA: {s}\n", .{self.text_line[0..end]});
+                                break;
+                            }
+
+                            length += result;
+                            buffer = self.text_line[length..];
+                        }
+                    },
+                    else => {
+                        try self.reply("{d} Bad sequence of commands", .{503});
+
+                        continue :origin try self.readCommand();
+                    },
+                }
+            },
+            else => {
                 try self.reply("{d} Bad sequence of commands", .{503});
-                return;
-            }
 
-            last_command = .HELO;
-
-            continue :state try self.read();
-        },
-        .MAIL => |path| {
-            std.debug.print("client: MAIL <SP> FROM:<{s}@{s}>\n", .{ path.user.get(), path.domain.get() });
-
-            if (last_command != .HELO) {
-                try self.reply("{d} Bad sequence of commands", .{503});
-                return;
-            }
-
-            last_command = .MAIL;
-
-            continue :state try self.read();
-        },
-        .RCPT => |path| {
-            std.debug.print("client: RCPT <SP> TO:<{s}@{s}>\n", .{ path.user.get(), path.domain.get() });
-
-            if (last_command != .HELO or last_command != .RCPT) {
-                try self.reply("{d} Bad sequence of commands", .{503});
-                return;
-            }
-
-            last_command = .RCPT;
-
-            continue :state try self.read();
-        },
-        .DATA => {
-            std.debug.print("client: DATA\n", .{});
-            return;
+                continue :origin try self.readCommand();
+            },
         },
         .QUIT => {
             try self.reply("{d} {s} Service closing transmission channel", .{ 221, domain });
-            return;
         },
-        // else => {
-        //     try self.reply("{d} Bad sequence of commands", .{503});
-        // },
+        else => {
+            try self.reply("{d} Bad sequence of commands", .{503});
+
+            continue :origin try self.readCommand();
+        },
     }
 }
 
@@ -88,7 +118,7 @@ pub fn reply(self: *Self, comptime format: []const u8, args: anytype) !void {
         return error.WriteFailed;
 }
 
-pub fn read(self: *Self) !Command {
+pub fn readCommand(self: *Self) !Command {
     const result = linux.read(
         self.socket,
         &self.commad_line,
